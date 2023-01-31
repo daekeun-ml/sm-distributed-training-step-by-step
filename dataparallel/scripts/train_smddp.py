@@ -24,12 +24,12 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 os.environ['TOKENIZERS_PARALLELISM'] = "True"
+
 # SageMaker data parallel: Import the library PyTorch API
-import smdistributed.dataparallel.torch.torch_smddp        
+import smdistributed.dataparallel.torch.torch_smddp      
+        
 def setup():
-    # initialize the process group: 여러 노드에 있는 여러 프로세스가 동기화되고 통신합니다
-    dist.init_process_group(backend="smddp")
-    
+
     if 'WORLD_SIZE' in os.environ:
         # Environment variables set by torch.distributed.launch or torchrun
         world_size = int(os.environ['WORLD_SIZE'])
@@ -42,7 +42,12 @@ def setup():
         local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
     else:
         sys.exit("Can't find the evironment variables for local rank")
-
+        
+    # initialize the process group: 여러 노드에 있는 여러 프로세스가 동기화되고 통신합니다
+    dist.init_process_group(backend="smddp")
+    #torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)    
+        
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -54,6 +59,7 @@ def setup():
     config.world_size = world_size
     config.rank = rank
     config.local_rank = local_rank
+    config.device = device
     return config
 
 def cleanup():
@@ -63,7 +69,7 @@ def parser_args(train_notebook=False):
     parser = argparse.ArgumentParser()
 
     # Default Setting
-    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_batch_size", type=int, default=32)
     parser.add_argument("--eval_batch_size", type=int, default=64)
@@ -90,7 +96,6 @@ def parser_args(train_notebook=False):
 def main(args):
     
     torch.manual_seed(args.seed)
-    device = torch.device("cuda", args.local_rank)
     
 #     train_dataset = load_dataset("nsmc", split="train")
 #     eval_dataset = load_dataset("nsmc", split="test")
@@ -122,8 +127,8 @@ def main(args):
     logging.info(train_dataset[0])     
 
     # 미니배치가 겹치지 않게 함
-    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
-    eval_sampler = DistributedSampler(eval_dataset, num_replicas=args.world_size, rank=args.rank)
+    train_sampler = DistributedSampler(train_dataset)
+    eval_sampler = DistributedSampler(eval_dataset)
      
     train_loader = DataLoader(
         dataset=train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, 
@@ -137,8 +142,8 @@ def main(args):
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.output_data_dir, exist_ok=True)    
     
-    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(device)
-    model = DDP(model, device_ids=[device])
+    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(args.device)
+    model = DDP(model, device_ids=[args.local_rank])
     
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     num_training_steps = args.num_epochs * len(train_loader)
@@ -148,29 +153,30 @@ def main(args):
     lr_scheduler = get_scheduler(
         name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
     )
-    pbar = tqdm(total=num_training_steps, leave=True, desc="Training")    
-    
+
     for epoch in range(1, args.num_epochs+1):
         train_sampler.set_epoch(epoch)
         eval_sampler.set_epoch(epoch)
         
-        train_model(args, device, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar)
+        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
         if args.rank == 0:
-            eval_model(device, model, eval_loader)
+            eval_model(args, model, eval_loader)
 
-    pbar.close()
     if args.model_dir and args.rank == 0:
         torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
             
             
-def train_model(args, device, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar):
+def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
 
     # AMP (Create gradient scaler)
     scaler = GradScaler(init_scale=16384)
-    
+
+    if args.rank == 0:
+        epoch_pbar = tqdm(total=len(train_loader), colour="blue", leave=True, desc=f"Training epoch {epoch}")    
+        
     for batch_idx, batch in enumerate(train_loader):
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(args.local_rank) for k, v in batch.items()}
         optimizer.zero_grad()
         
         with torch.cuda.amp.autocast(enabled=args.use_fp16):
@@ -187,19 +193,24 @@ def train_model(args, device, model, train_loader, eval_loader, optimizer, lr_sc
             optimizer.step()
         
         lr_scheduler.step()
-        pbar.update(1)
+        if args.rank == 0:
+            epoch_pbar.update(1)
         
         if batch_idx % args.log_interval == 0 and args.rank == 0:
-            logging.info(f"[Epoch {epoch} {((epoch-1) * args.world_size)+batch_idx}/{args.num_training_steps}, Train loss: {loss.item()}")
+            logging.info(f"Train loss: {loss.item()}")
+            
+    if args.rank == 0:
+        epoch_pbar.close()
+    
 
-def eval_model(device, model, eval_loader):
+def eval_model(args, model, eval_loader):
     model.eval()
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
     
     with torch.no_grad():
         for batch in eval_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch['labels'].to(device)
+            batch = {k: v.to(args.local_rank) for k, v in batch.items()}
+            labels = batch['labels'].to(args.local_rank)
             outputs = model(**batch)
             loss = outputs.loss
             logits = outputs.logits
@@ -230,6 +241,7 @@ if __name__ == "__main__":
     args.world_size = config.world_size
     args.rank = config.rank
     args.local_rank = config.local_rank
+    args.device = config.device
     
     start = time.time()
     main(args)     
