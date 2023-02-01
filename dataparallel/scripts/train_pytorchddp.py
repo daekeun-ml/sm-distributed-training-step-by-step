@@ -41,8 +41,8 @@ def setup():
         sys.exit("Can't find the evironment variables for local rank")
         
     # initialize the process group: 여러 노드에 있는 여러 프로세스가 동기화되고 통신합니다
-    dist.init_process_group(backend="nccl")
-    #torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)    
     device = torch.device("cuda", local_rank)    
         
     logging.basicConfig(
@@ -50,7 +50,7 @@ def setup():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if rank == 0 else logging.WARNING,
         handlers=[TqdmLoggingHandler()])
-    logging.info(f"Training begin. world_size: {world_size}")
+    logging.info(f"Initialized the distributed environment. world_size={world_size}, rank={rank}, local_rank={local_rank}")
         
     config = SimpleNamespace()
     config.world_size = world_size
@@ -160,6 +160,7 @@ def main(args):
             eval_model(args, model, eval_loader)
 
     if args.model_dir and args.rank == 0:
+        logging.info('==== Save Model ====')        
         torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
             
             
