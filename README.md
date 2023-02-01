@@ -5,7 +5,7 @@ This repository provides hands-on labs on PyTorch-based Distributed Training and
 ## Contents
 
 - [Data Parallel](dataparallel)
-- Model Parallel (WIP)
+- [Model Parallel](modelparallel)
 
 ## Requirements
 Before starting, you have met the following requirements:
