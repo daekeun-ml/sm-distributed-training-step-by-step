@@ -24,9 +24,9 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 os.environ['TOKENIZERS_PARALLELISM'] = "True"
+        
+import deepspeed
     
-import deepspeed    
-
 def setup():
 
     if 'WORLD_SIZE' in os.environ:
@@ -42,16 +42,20 @@ def setup():
     else:
         sys.exit("Can't find the evironment variables for local rank")
     
-    dist.init_process_group(backend="nccl")
-    deepspeed.init_distributed("nccl")
-       
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)    
+
+    # SageMaker Training does not need to call deepspeed.init_distributed()
+    if not 'SM_CHANNEL' in os.environ:
+        deepspeed.init_distributed("nccl")
+
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if rank == 0 else logging.WARNING,
         handlers=[TqdmLoggingHandler()])
-    logging.info(f"Training begin. world_size: {world_size}")
-        
+    logging.info(f"Initialized the distributed environment. world_size={world_size}, rank={rank}, local_rank={local_rank}")
+            
     config = SimpleNamespace()
     config.world_size = world_size
     config.rank = rank
@@ -85,7 +89,7 @@ def setup():
                 "eps": 1e-8
             }
         },
-    }   
+    }    
     return config, deepspeed_config
 
 def cleanup():
@@ -135,11 +139,10 @@ def main(args, deepspeed_config):
 #     eval_num_samples = 1000
 #     train_dataset = train_dataset.shuffle(seed=42).select(range(train_num_samples))
 #     eval_dataset = eval_dataset.shuffle(seed=42).select(range(eval_num_samples))
-
+    
     logging.info(f" loaded train_dataset length is: {len(train_dataset)}")
     logging.info(f" loaded test_dataset length is: {len(eval_dataset)}")
-    logging.info(train_dataset[0])     
-
+    
     # 미니배치가 겹치지 않게 함
     train_sampler = DistributedSampler(train_dataset)
     eval_sampler = DistributedSampler(eval_dataset)
@@ -171,7 +174,7 @@ def main(args, deepspeed_config):
     # lr_scheduler = get_scheduler(
     #     name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
     # )
-    for epoch in range(1, args.num_epochs+1):  
+    for epoch in range(1, args.num_epochs+1):
         if args.rank == 0:
             logging.info(f"==== Epoch {epoch} start ====")
         train_sampler.set_epoch(epoch)
@@ -182,6 +185,7 @@ def main(args, deepspeed_config):
             eval_model(model, eval_loader)
 
     if args.model_dir and args.rank == 0:
+        logging.info('==== Save Model ====')
         torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
             
             
@@ -197,9 +201,6 @@ def train_model(args, model, train_loader, eval_loader, optimizer, epoch):
         
         outputs = model(**batch)
         loss = outputs.loss        
-        #loss.backward()
-        #optimizer.step()
-        #lr_scheduler.step()
         model.backward(loss)
         model.step()
         
@@ -248,8 +249,10 @@ if __name__ == "__main__":
 
     args = parser_args()
     config, deepspeed_config = setup() 
+    
     args.world_size = config.world_size
     args.rank = config.rank
+    #args.local_rank = local_rank
 
     start = time.time()
     main(args, deepspeed_config)     
