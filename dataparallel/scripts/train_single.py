@@ -25,6 +25,7 @@ def setup():
     world_size = 1
     rank = 0
     local_rank = 0
+    device = torch.device("cuda", local_rank)    
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -37,6 +38,7 @@ def setup():
     config.world_size = world_size
     config.rank = rank
     config.local_rank = local_rank
+    config.device = device    
     return config
 
 def parser_args(train_notebook=False):
@@ -70,8 +72,7 @@ def parser_args(train_notebook=False):
 def main(args):
     
     torch.manual_seed(args.seed)
-    device = torch.device("cuda", args.local_rank)
-    
+
 #     train_dataset = load_dataset("nsmc", split="train")
 #     eval_dataset = load_dataset("nsmc", split="test")
 #     train_num_samples = 2000
@@ -103,17 +104,17 @@ def main(args):
 
     train_loader = DataLoader(
         dataset=train_dataset, batch_size=args.train_batch_size, 
-        num_workers=4, shuffle=True
+        num_workers=0, shuffle=True
     )    
     eval_loader = DataLoader(
         dataset=eval_dataset, batch_size=args.eval_batch_size, 
-        num_workers=4, shuffle=False
+        num_workers=0, shuffle=False
     )
 
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.output_data_dir, exist_ok=True)    
     
-    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(device)
+    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(args.device)
     
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     num_training_steps = args.num_epochs * len(train_loader)
@@ -123,23 +124,22 @@ def main(args):
     lr_scheduler = get_scheduler(
         name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
     )
-    pbar = tqdm(total=num_training_steps, leave=True, desc="Training")    
-    
-    for epoch in range(1, args.num_epochs+1):
-        train_model(args, device, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar)
-        if args.rank == 0:
-            eval_model(device, model, eval_loader)
 
-    pbar.close()
+    for epoch in range(1, args.num_epochs+1):
+        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
+        if args.rank == 0:
+            eval_model(args, model, eval_loader)
+
     if args.model_dir and args.rank == 0:
         torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
             
             
-def train_model(args, device, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar):
+def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
-
+    epoch_pbar = tqdm(total=len(train_loader), colour="blue", leave=True, desc=f"Training epoch {epoch}") 
+    
     for batch_idx, batch in enumerate(train_loader):
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(args.local_rank) for k, v in batch.items()}
         optimizer.zero_grad()
         
         outputs = model(**batch)
@@ -148,26 +148,31 @@ def train_model(args, device, model, train_loader, eval_loader, optimizer, lr_sc
         optimizer.step()
         
         lr_scheduler.step()
-        pbar.update(1)
+        epoch_pbar.update(1)
         
         if batch_idx % args.log_interval == 0 and args.rank == 0:
-            logging.info(f"[Epoch {epoch} {((epoch-1) * args.world_size)+batch_idx}/{args.num_training_steps}, Train loss: {loss.item()}")
+            logging.info(f"Train loss: {loss.item()}")
 
-def eval_model(device, model, eval_loader):
+            
+def eval_model(args, model, eval_loader):
     model.eval()
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+    history = torch.zeros(3).to(args.local_rank)
     
     with torch.no_grad():
         for batch in eval_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch['labels'].to(device)
+            batch = {k: v.to(args.local_rank) for k, v in batch.items()}
+            labels = batch['labels'].to(args.local_rank)
             outputs = model(**batch)
-            loss = outputs.loss
+            loss = outputs['loss']
             logits = outputs.logits
             preds = torch.argmax(logits, dim=-1)
+            history[0] += loss.item()
+            history[1] += preds.eq(labels.view_as(preds)).sum().item()
+            history[2] += len(batch['labels'])
             metrics.add_batch(predictions=preds, references=batch["labels"])
 
-    logging.info(f"Eval. loss: {loss.item()}")          
+    logging.info(f"Eval. loss: {loss.item()}")
     logging.info(pformat(metrics.compute()))
 
 if __name__ == "__main__":
@@ -188,10 +193,10 @@ if __name__ == "__main__":
 
     args = parser_args()
     config = setup() 
-    print(config)
     args.world_size = config.world_size
     args.rank = config.rank
     args.local_rank = config.local_rank
+    args.device = config.device
     
     start = time.time()
     main(args)     

@@ -4,6 +4,7 @@ import torch
 import transformers
 import logging
 import argparse
+import functools
 import time, datetime
 from types import SimpleNamespace
 from tqdm import tqdm
@@ -24,18 +25,14 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 os.environ['TOKENIZERS_PARALLELISM'] = "True"
- 
-import functools    
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import torch.nn.functional as F
+
+# FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     CPUOffload,
     BackwardPrefetch,
 )
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
+
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -44,24 +41,13 @@ from torch.distributed.fsdp import (
     FullStateDictConfig,
     StateDictType,
 )
-
-fpSixteen = MixedPrecision(
-    param_dtype=torch.float16,
-    # Gradient communication precision.
-    reduce_dtype=torch.float16,
-    # Buffer precision.
-    buffer_dtype=torch.float16,
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,    
+    transformer_auto_wrap_policy,
+    enable_wrap,
+    wrap,
 )
-
-bfSixteen = MixedPrecision(
-    param_dtype=torch.bfloat16,
-    # Gradient communication precision.
-    reduce_dtype=torch.bfloat16,
-    # Buffer precision.
-    buffer_dtype=torch.bfloat16,
-)
-
-
+        
 def setup():
 
     if 'WORLD_SIZE' in os.environ:
@@ -76,22 +62,44 @@ def setup():
         local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
     else:
         sys.exit("Can't find the evironment variables for local rank")
-
+        
     # initialize the process group: 여러 노드에 있는 여러 프로세스가 동기화되고 통신합니다
-    dist.init_process_group(backend="nccl")
-    
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)    
+    device = torch.device("cuda", local_rank)    
+        
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if rank == 0 else logging.WARNING,
         handlers=[TqdmLoggingHandler()])
-    logging.info(f"Training begin. world_size: {world_size}")
+    logging.info(f"Initialized the distributed environment. world_size={world_size}, rank={rank}, local_rank={local_rank}")
         
     config = SimpleNamespace()
     config.world_size = world_size
     config.rank = rank
     config.local_rank = local_rank
+    config.device = device
     return config
+
+
+def get_mp_policy(args):
+
+    fp16_policy = MixedPrecision(
+        param_dtype=torch.float16,
+        # Gradient communication precision.
+        reduce_dtype=torch.float16,
+        # Buffer precision.
+        buffer_dtype=torch.float16,
+    )
+
+    fp32_policy = None
+    
+    if args.use_fp16:
+        return fp16_policy
+    else:
+        return fp32_policy
+    
 
 def cleanup():
     dist.destroy_process_group()
@@ -107,7 +115,7 @@ def parser_args(train_notebook=False):
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--disable_tqdm", type=bool, default=True)
-    parser.add_argument("--use_fp16", type=bool, default=True)    
+    parser.add_argument("--use_fp16", type=bool, default=False)    
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--model_id", type=str, default='bert-base-multilingual-cased')
     
@@ -124,11 +132,11 @@ def parser_args(train_notebook=False):
         args = parser.parse_args()
     return args
 
-def main(args):
-    
+
+#def main(args)
+#def main(rank, world_size, args):
+def main(args):    
     torch.manual_seed(args.seed)
-    torch.cuda.set_device(args.local_rank)
-    #device = torch.device("cuda", args.local_rank)
     
 #     train_dataset = load_dataset("nsmc", split="train")
 #     eval_dataset = load_dataset("nsmc", split="test")
@@ -160,37 +168,33 @@ def main(args):
     logging.info(train_dataset[0])     
 
     # 미니배치가 겹치지 않게 함
-    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
-    eval_sampler = DistributedSampler(eval_dataset, num_replicas=args.world_size, rank=args.rank)
+    train_sampler = DistributedSampler(train_dataset, rank=args.rank, num_replicas=args.world_size, shuffle=True)
+    eval_sampler = DistributedSampler(eval_dataset, rank=args.rank, num_replicas=args.world_size)
      
-    train_loader = DataLoader(
-        dataset=train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, 
-        num_workers=4*torch.cuda.device_count(), shuffle=False
-    )    
-    eval_loader = DataLoader(
-        dataset=eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, 
-        num_workers=4*torch.cuda.device_count(), shuffle=False
-    )
+        
+    train_kwargs = {'batch_size': args.train_batch_size, 'sampler': train_sampler}
+    eval_kwargs = {'batch_size': args.eval_batch_size, 'sampler': eval_sampler}
+    cuda_kwargs = {'num_workers': 2, 'pin_memory': True, 'shuffle': False}
+    train_kwargs.update(cuda_kwargs)
+    eval_kwargs.update(cuda_kwargs)
     
+    
+    train_loader = DataLoader(train_dataset, **train_kwargs)    
+    eval_loader = DataLoader(eval_dataset, **eval_kwargs)
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=100
     )
-    mp_policy = bfSixteen
-    sharding_strategy: ShardingStrategy = ShardingStrategy.SHARD_GRAD_OP 
     #torch.cuda.set_device(rank)
     
-
+    
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.output_data_dir, exist_ok=True)    
     
-    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2)#.to(args.local_rank)
-    #model = DDP(model, device_ids=[device])
-    model = FSDP(model,
-        auto_wrap_policy=my_auto_wrap_policy,
-        #mixed_precision=mp_policy,
-        sharding_strategy=sharding_strategy,
-        device_id=args.local_rank)
-    
+    model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(args.device)
+    #model = DDP(model, device_ids=[args.local_rank])
+    sharding_strategy: ShardingStrategy = ShardingStrategy.SHARD_GRAD_OP
+    model = FSDP(model, sharding_strategy=sharding_strategy, mixed_precision=get_mp_policy(args), device_id=torch.cuda.current_device())
+    #, fsdp_auto_wrap_policy=my_auto_wrap_policy)
     
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     num_training_steps = args.num_epochs * len(train_loader)
@@ -200,58 +204,136 @@ def main(args):
     lr_scheduler = get_scheduler(
         name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
     )
-    pbar = tqdm(total=num_training_steps, leave=True, desc="Training")    
-    
+
     for epoch in range(1, args.num_epochs+1):
         train_sampler.set_epoch(epoch)
         eval_sampler.set_epoch(epoch)
         
-        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar)
+        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
+        # if args.rank == 0:
+        #     eval_model(args, model, eval_loader)
+
+    if args.model_dir:
+        logging.info('==== Save Model ====')  
+        dist.barrier()
+        states = model.state_dict()
         if args.rank == 0:
-            eval_model(model, eval_loader)
-
-    pbar.close()
-    #if args.model_dir and args.rank == 0:
-    #    torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
+            torch.save(states, os.path.join(args.model_dir, "model.pt"))
             
-            
-def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch, pbar):
+def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
-
-
+    ddp_loss = torch.zeros(2).to(args.rank)
+    
+    if args.rank == 0:
+        epoch_pbar = tqdm(total=len(train_loader), colour="blue", leave=True, desc=f"Training epoch {epoch}")    
+        
     for batch_idx, batch in enumerate(train_loader):
         batch = {k: v.to(args.local_rank) for k, v in batch.items()}
         optimizer.zero_grad()
         
-
         outputs = model(**batch)
         loss = outputs.loss
-
+                  
         loss.backward()
         optimizer.step()
 
+        ddp_loss[0] += loss.item()
+        ddp_loss[1] += len(batch['labels'])
+        
         lr_scheduler.step()
-        pbar.update(1)
+        if args.rank == 0:
+            epoch_pbar.update(1)
         
         if batch_idx % args.log_interval == 0 and args.rank == 0:
-            logging.info(f"[Epoch {epoch} {((epoch-1) * args.world_size)+batch_idx}/{args.num_training_steps}, Train loss: {loss.item()}")
+            logging.info(f"Train loss: {loss.item()}")
 
-def eval_model(model, eval_loader):
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)            
+    if args.rank == 0:
+        avg_loss = ddp_loss[0]/ddp_loss[1]
+        logging.info(f"Epoch: {epoch} End - \t Train Avg. Loss: {avg_loss:.6f}")
+        epoch_pbar.close()
+    
+# I don't know why validation step for FSDP doesn't work. It freezes for tens of minutes and runs forever.
+# https://github.com/facebookresearch/fairseq/issues/3532
+# https://github.com/pytorch/pytorch/issues/82206
+def eval_model(args, model, eval_loader):
     model.eval()
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+    ddp_loss = torch.zeros(3).to(args.rank)
+    if args.rank == 0:
+        epoch_pbar = tqdm(total=len(eval_loader), colour="green", leave=True, desc="Validation epoch")    
+            
+    
+    with torch.no_grad():
+        for batch in eval_loader:
+            #batch = {k: v.to(args.local_rank) for k, v in b.items()}
+            #labels = batch['labels'].to(args.local_rank)
+            #outputs = model(**batch)
+            for key in batch.keys():
+                batch[key] = batch[key].to(args.local_rank)
+            
+            print(batch)
+            outputs= model(input_ids=batch["input_ids"],attention_mask=batch["attention_mask"],labels=batch["labels"])
+            if args.rank == 0:
+                epoch_pbar.update(1)
+                
+            # logits = outputs.logits
+            # preds = torch.argmax(logits, dim=-1)
+            #loss = outputs.loss
+            #ddp_loss[0] += loss.item()
+            #ddp_loss[0] += F.nll_loss(outputs, labels, reduction='sum').item()  # sum up batch loss
+            #preds = outputs.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            #ddp_loss[1] += preds.eq(labels.view_as(preds)).sum().item()
+            #ddp_loss[2] += len(batch['labels'])
+            # loss = outputs.loss
+            # logits = outputs.logits
+            # preds = torch.argmax(logits, dim=-1)
+            # metrics.add_batch(predictions=preds, references=batch["labels"])
+            
+    if args.rank == 0:
+        epoch_pbar.close()    
+            
+    # if args.rank == 0:
+    #     #eval_loss = ddp_loss[0] / ddp_loss[2]
+    #     print('Eval set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+    #         test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+    #         100. * ddp_loss[1] / ddp_loss[2]))            
+    #logging.info(f"Eval. loss: {loss.item()}")          
+    #logging.info(pformat(metrics.compute()))
+
+
+        
+def eval_model2(args, model, eval_loader):
+    model.eval()
+    metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+    ddp_loss = torch.zeros(3).to(args.rank)
     
     with torch.no_grad():
         for batch in eval_loader:
             batch = {k: v.to(args.local_rank) for k, v in batch.items()}
             labels = batch['labels'].to(args.local_rank)
             outputs = model(**batch)
-            loss = outputs.loss
             logits = outputs.logits
             preds = torch.argmax(logits, dim=-1)
-            metrics.add_batch(predictions=preds, references=batch["labels"])
+            #loss = outputs.loss
+            #ddp_loss[0] += loss.item()
+            #ddp_loss[0] += F.nll_loss(outputs, labels, reduction='sum').item()  # sum up batch loss
+            #preds = outputs.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            ddp_loss[1] += preds.eq(labels.view_as(preds)).sum().item()
+            ddp_loss[2] += len(batch['labels'])
+            # loss = outputs.loss
+            # logits = outputs.logits
+            # preds = torch.argmax(logits, dim=-1)
+            # metrics.add_batch(predictions=preds, references=batch["labels"])
 
-    logging.info(f"Eval. loss: {loss.item()}")          
-    logging.info(pformat(metrics.compute()))
+            
+    if args.rank == 0:
+        #eval_loss = ddp_loss[0] / ddp_loss[2]
+        print('Eval set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+            100. * ddp_loss[1] / ddp_loss[2]))            
+    #logging.info(f"Eval. loss: {loss.item()}")          
+    #logging.info(pformat(metrics.compute()))
 
 if __name__ == "__main__":
     
@@ -274,6 +356,15 @@ if __name__ == "__main__":
     args.world_size = config.world_size
     args.rank = config.rank
     args.local_rank = config.local_rank
+    args.device = config.device
+    
+
+#     start = time.time()
+#     WORLD_SIZE = torch.cuda.device_count()
+#     mp.spawn(main,
+#         args=(WORLD_SIZE, args),
+#         nprocs=WORLD_SIZE,
+#         join=True)    
     
     start = time.time()
     main(args)     
@@ -281,5 +372,4 @@ if __name__ == "__main__":
     result = datetime.timedelta(seconds=secs)
     if config.rank == 0:
         logging.info(f"Elapsed time: {result}")
-    dist.barrier()
     cleanup()
