@@ -111,7 +111,7 @@ def parser_args(train_notebook=False):
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_batch_size", type=int, default=32)
-    parser.add_argument("--eval_batch_size", type=int, default=64)
+    parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--disable_tqdm", type=bool, default=True)
@@ -133,8 +133,6 @@ def parser_args(train_notebook=False):
     return args
 
 
-#def main(args)
-#def main(rank, world_size, args):
 def main(args):    
     torch.manual_seed(args.seed)
     
@@ -171,21 +169,17 @@ def main(args):
     train_sampler = DistributedSampler(train_dataset, rank=args.rank, num_replicas=args.world_size, shuffle=True)
     eval_sampler = DistributedSampler(eval_dataset, rank=args.rank, num_replicas=args.world_size)
      
-        
     train_kwargs = {'batch_size': args.train_batch_size, 'sampler': train_sampler}
     eval_kwargs = {'batch_size': args.eval_batch_size, 'sampler': eval_sampler}
-    cuda_kwargs = {'num_workers': 2, 'pin_memory': True, 'shuffle': False}
+    cuda_kwargs = {'num_workers': 0, 'pin_memory': True, 'shuffle': False}
     train_kwargs.update(cuda_kwargs)
     eval_kwargs.update(cuda_kwargs)
-    
     
     train_loader = DataLoader(train_dataset, **train_kwargs)    
     eval_loader = DataLoader(eval_dataset, **eval_kwargs)
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=100
     )
-    #torch.cuda.set_device(rank)
-    
     
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.output_data_dir, exist_ok=True)    
@@ -210,8 +204,7 @@ def main(args):
         eval_sampler.set_epoch(epoch)
         
         train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
-        # if args.rank == 0:
-        #     eval_model(args, model, eval_loader)
+        eval_model(args, model, eval_loader)
 
     if args.model_dir:
         logging.info('==== Save Model ====')  
@@ -219,6 +212,7 @@ def main(args):
         states = model.state_dict()
         if args.rank == 0:
             torch.save(states, os.path.join(args.model_dir, "model.pt"))
+            
             
 def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
@@ -247,7 +241,8 @@ def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler,
         if batch_idx % args.log_interval == 0 and args.rank == 0:
             logging.info(f"Train loss: {loss.item()}")
 
-    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)            
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+    
     if args.rank == 0:
         avg_loss = ddp_loss[0]/ddp_loss[1]
         logging.info(f"Epoch: {epoch} End - \t Train Avg. Loss: {avg_loss:.6f}")
@@ -258,82 +253,44 @@ def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler,
 # https://github.com/pytorch/pytorch/issues/82206
 def eval_model(args, model, eval_loader):
     model.eval()
+    
+    correct = 0
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
     ddp_loss = torch.zeros(3).to(args.rank)
+    
     if args.rank == 0:
         epoch_pbar = tqdm(total=len(eval_loader), colour="green", leave=True, desc="Validation epoch")    
             
-    
-    with torch.no_grad():
-        for batch in eval_loader:
-            #batch = {k: v.to(args.local_rank) for k, v in b.items()}
-            #labels = batch['labels'].to(args.local_rank)
-            #outputs = model(**batch)
-            for key in batch.keys():
-                batch[key] = batch[key].to(args.local_rank)
-            
-            print(batch)
-            outputs= model(input_ids=batch["input_ids"],attention_mask=batch["attention_mask"],labels=batch["labels"])
-            if args.rank == 0:
-                epoch_pbar.update(1)
-                
-            # logits = outputs.logits
-            # preds = torch.argmax(logits, dim=-1)
-            #loss = outputs.loss
-            #ddp_loss[0] += loss.item()
-            #ddp_loss[0] += F.nll_loss(outputs, labels, reduction='sum').item()  # sum up batch loss
-            #preds = outputs.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            #ddp_loss[1] += preds.eq(labels.view_as(preds)).sum().item()
-            #ddp_loss[2] += len(batch['labels'])
-            # loss = outputs.loss
-            # logits = outputs.logits
-            # preds = torch.argmax(logits, dim=-1)
-            # metrics.add_batch(predictions=preds, references=batch["labels"])
-            
-    if args.rank == 0:
-        epoch_pbar.close()    
-            
-    # if args.rank == 0:
-    #     #eval_loss = ddp_loss[0] / ddp_loss[2]
-    #     print('Eval set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
-    #         test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
-    #         100. * ddp_loss[1] / ddp_loss[2]))            
-    #logging.info(f"Eval. loss: {loss.item()}")          
-    #logging.info(pformat(metrics.compute()))
-
-
-        
-def eval_model2(args, model, eval_loader):
-    model.eval()
-    metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
-    ddp_loss = torch.zeros(3).to(args.rank)
-    
     with torch.no_grad():
         for batch in eval_loader:
             batch = {k: v.to(args.local_rank) for k, v in batch.items()}
             labels = batch['labels'].to(args.local_rank)
             outputs = model(**batch)
+            
+            #outputs= model(input_ids=batch["input_ids"],attention_mask=batch["attention_mask"],labels=batch["labels"])
+            if args.rank == 0:
+                epoch_pbar.update(1)
+                
             logits = outputs.logits
-            preds = torch.argmax(logits, dim=-1)
-            #loss = outputs.loss
-            #ddp_loss[0] += loss.item()
+            # preds = torch.argmax(logits, dim=-1)
+            loss = outputs.loss
+            ddp_loss[0] += loss.item()
             #ddp_loss[0] += F.nll_loss(outputs, labels, reduction='sum').item()  # sum up batch loss
-            #preds = outputs.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            ddp_loss[1] += preds.eq(labels.view_as(preds)).sum().item()
-            ddp_loss[2] += len(batch['labels'])
+            preds = logits.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            ddp_loss[1] += len(batch['labels'])
+            ddp_loss[2] += preds.eq(labels.view_as(preds)).sum().item()
             # loss = outputs.loss
             # logits = outputs.logits
             # preds = torch.argmax(logits, dim=-1)
-            # metrics.add_batch(predictions=preds, references=batch["labels"])
-
+            metrics.add_batch(predictions=preds, references=batch["labels"])
             
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+    avg_loss = ddp_loss[0]/ddp_loss[1]
+    
     if args.rank == 0:
-        #eval_loss = ddp_loss[0] / ddp_loss[2]
-        print('Eval set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
-            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
-            100. * ddp_loss[1] / ddp_loss[2]))            
-    #logging.info(f"Eval. loss: {loss.item()}")          
-    #logging.info(pformat(metrics.compute()))
+        epoch_pbar.close()
+        logging.info(f"Valid Avg. Loss: {avg_loss:.6f} \t Accuracy: ({int(ddp_loss[2])}/{int(ddp_loss[1])})")             
+        logging.info(pformat(metrics.compute()))
 
 if __name__ == "__main__":
     
@@ -357,14 +314,6 @@ if __name__ == "__main__":
     args.rank = config.rank
     args.local_rank = config.local_rank
     args.device = config.device
-    
-
-#     start = time.time()
-#     WORLD_SIZE = torch.cuda.device_count()
-#     mp.spawn(main,
-#         args=(WORLD_SIZE, args),
-#         nprocs=WORLD_SIZE,
-#         join=True)    
     
     start = time.time()
     main(args)     

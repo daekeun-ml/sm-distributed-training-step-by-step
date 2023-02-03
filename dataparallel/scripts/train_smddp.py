@@ -132,11 +132,11 @@ def main(args):
      
     train_loader = DataLoader(
         dataset=train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, 
-        num_workers=4*torch.cuda.device_count(), shuffle=False
+        num_workers=0, shuffle=False
     )    
     eval_loader = DataLoader(
         dataset=eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, 
-        num_workers=4*torch.cuda.device_count(), shuffle=False
+        num_workers=0, shuffle=False
     )
 
     os.makedirs(args.model_dir, exist_ok=True)
@@ -158,9 +158,8 @@ def main(args):
         train_sampler.set_epoch(epoch)
         eval_sampler.set_epoch(epoch)
         
-        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
-        if args.rank == 0:
-            eval_model(args, model, eval_loader)
+        #train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
+        eval_model(args, model, eval_loader)
 
     if args.model_dir and args.rank == 0:
         logging.info('==== Save Model ====')        
@@ -169,7 +168,8 @@ def main(args):
             
 def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
-
+    history = torch.zeros(2).to(args.local_rank)
+    
     # AMP (Create gradient scaler)
     scaler = GradScaler(init_scale=16384)
 
@@ -194,19 +194,31 @@ def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler,
             optimizer.step()
         
         lr_scheduler.step()
+        
+        history[0] += loss.item()
+        history[1] += len(batch['labels'])   
+    
         if args.rank == 0:
             epoch_pbar.update(1)
         
         if batch_idx % args.log_interval == 0 and args.rank == 0:
             logging.info(f"Train loss: {loss.item()}")
             
-    if args.rank == 0:
-        epoch_pbar.close()
-    
+    dist.all_reduce(history, op=dist.ReduceOp.SUM)
 
+    if args.rank == 0:
+        avg_loss = history[0] / history[1]
+        logging.info(f"Train avg. loss: {avg_loss:.6f}")            
+        epoch_pbar.close()
+        
+        
 def eval_model(args, model, eval_loader):
     model.eval()
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+    history = torch.zeros(3).to(args.local_rank)
+
+    if args.rank == 0:
+        eval_pbar = tqdm(total=len(eval_loader), colour="green", leave=True, desc=f"Evaluation")    
     
     with torch.no_grad():
         for batch in eval_loader:
@@ -216,10 +228,21 @@ def eval_model(args, model, eval_loader):
             loss = outputs.loss
             logits = outputs.logits
             preds = torch.argmax(logits, dim=-1)
+            history[0] += loss.item()
+            history[1] += len(batch['labels'])   
+            history[2] += preds.eq(labels.view_as(preds)).sum().item()
+         
             metrics.add_batch(predictions=preds, references=batch["labels"])
+            if args.rank == 0:
+                eval_pbar.update(1)
 
-    logging.info(f"Eval. loss: {loss.item()}")          
-    logging.info(pformat(metrics.compute()))
+    dist.all_reduce(history, op=dist.ReduceOp.SUM)
+
+    if args.rank == 0:
+        avg_loss = history[0] / history[1]
+        logging.info(f"Eval avg. loss: {avg_loss:.6f}, # of correct: ({int(history[2])}/{int(history[1])})")          
+        logging.info(pformat(metrics.compute()))    
+        eval_pbar.close()    
 
 if __name__ == "__main__":
     
