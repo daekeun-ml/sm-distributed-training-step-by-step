@@ -27,7 +27,6 @@ os.environ['TOKENIZERS_PARALLELISM'] = "True"
 
 # SageMaker data parallel: Import the library PyTorch API
 import smdistributed.dataparallel.torch.torch_smddp
-
 import smdistributed.modelparallel.torch as smp
         
 def setup():
@@ -151,6 +150,11 @@ def main(args):
         dataset=eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, 
         num_workers=0, shuffle=False, drop_last=True
     )
+    
+    # eval_loader = DataLoader(
+    #     dataset=eval_dataset, batch_size=args.eval_batch_size, 
+    #     num_workers=0, shuffle=False, drop_last=True
+    # )    
 
     os.makedirs(args.model_dir, exist_ok=True)
     print(f"make dir={args.model_dir}")
@@ -179,8 +183,7 @@ def main(args):
         eval_sampler.set_epoch(epoch)
         
         train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
-        # if args.rank == 0:
-        #     eval_model(args, model, eval_loader)
+        eval_model(args, model, eval_loader)
     
     if args.model_dir and smp.dp_rank() == 0:
         output_save_file = os.path.join(args.model_dir, "model.pt")
@@ -194,14 +197,15 @@ def main(args):
             
  
 @smp.step
-def train_step(model, batch):
+def smp_train_step(model, batch):
     outputs = model(**batch)
     loss = outputs.loss
     model.backward(loss)
     return outputs, loss
 
+
 @smp.step
-def eval_step(model, batch):
+def smp_eval_step(model, batch):
     outputs = model(**batch)
     loss = outputs.loss
     return outputs, loss
@@ -209,48 +213,71 @@ def eval_step(model, batch):
 
 def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
-    
+    history = torch.zeros(2).to(args.local_rank)
+
     if args.rank == 0:
-        epoch_pbar = tqdm(total=len(train_loader), colour="blue", leave=True, desc=f"Training epoch {epoch}")    
+        train_pbar = tqdm(total=len(train_loader), colour="blue", leave=True, desc=f"Training epoch {epoch}")    
         
     for batch_idx, batch in enumerate(train_loader):
         batch = {k: v.to(args.local_rank) for k, v in batch.items()}
         optimizer.zero_grad()
         
-        outputs, loss = train_step(model, batch)
+        outputs, loss = smp_train_step(model, batch)
         optimizer.step()
         lr_scheduler.step()
         
+        history[0] += loss.reduce_mean().item()
+        history[1] += len(batch['labels'])   
+    
         if args.rank == 0:
-            epoch_pbar.update(1)
+            train_pbar.update(1)
         
         if batch_idx % args.log_interval == 0 and args.rank == 0:
             print(f"Train loss: {loss.reduce_mean()}")
             
+    dist.all_reduce(history, op=dist.ReduceOp.SUM)
+
     if args.rank == 0:
-        epoch_pbar.close()
-    
+        avg_loss = history[0] / history[1]
+        logging.info(f"Train avg. loss: {avg_loss:.6f}")               
+        train_pbar.close()
+        
 
 def eval_model(args, model, eval_loader):
     model.eval()
     metrics = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+    history = torch.zeros(3).to(args.local_rank)
 
+    if args.rank == 0:
+        eval_pbar = tqdm(total=len(eval_loader), colour="green", leave=True, desc=f"Evaluation")    
+    
     with torch.no_grad():
         for batch in eval_loader:
             batch = {k: v.to(args.local_rank) for k, v in batch.items()}
             labels = batch['labels'].to(args.local_rank)
 
-            outputs, loss = eval_step(model, batch)
-            #outputs = model(**batch)
-            #loss = outputs.loss
+            output, loss = smp_eval_step(model, batch)
+            #logging.info(output.keys())
+            logits = torch.cat(tuple(output['logits'].outputs), dim=0)
+            preds = torch.argmax(logits, dim=-1)
             
-#             logits = outputs.logits
-#             preds = torch.argmax(logits, dim=-1)
-#             metrics.add_batch(predictions=preds, references=batch["labels"])
+            history[0] += loss.reduce_mean().item()
+            history[1] += len(batch['labels'])   
+            history[2] += preds.eq(labels.view_as(preds)).sum().item()
+            
+            metrics.add_batch(predictions=preds, references=batch["labels"])
+            if args.rank == 0:
+                eval_pbar.update(1)
+          
+    dist.all_reduce(history, op=dist.ReduceOp.SUM)
+    
+    if args.rank == 0:
+        avg_loss = history[0] / history[1]
+        logging.info(f"Eval avg. loss: {avg_loss:.6f}, # of correct: ({int(history[2])}/{int(history[1])})")          
+        logging.info(pformat(metrics.compute()))    
+        eval_pbar.close()
 
-    #logging.info(f"Eval. loss: {loss.item()}")          
-    #logging.info(pformat(metrics.compute()))
-
+        
 if __name__ == "__main__":
     
     is_sm_container = True    
