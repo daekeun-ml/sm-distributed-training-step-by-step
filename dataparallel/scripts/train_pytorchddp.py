@@ -158,7 +158,7 @@ def main(args):
         train_sampler.set_epoch(epoch)
         eval_sampler.set_epoch(epoch)
         
-        #train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
+        train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
         eval_model(args, model, eval_loader)
 
     if args.model_dir and args.rank == 0:
