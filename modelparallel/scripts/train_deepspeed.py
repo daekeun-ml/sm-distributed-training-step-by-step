@@ -181,8 +181,7 @@ def main(args, deepspeed_config):
         eval_sampler.set_epoch(epoch)
         
         train_model(args, model, train_loader, eval_loader, optimizer, epoch)
-        if args.rank == 0:
-            eval_model(model, eval_loader)
+        eval_model(model, eval_loader)
 
     if args.model_dir and args.rank == 0:
         logging.info('==== Save Model ====')
