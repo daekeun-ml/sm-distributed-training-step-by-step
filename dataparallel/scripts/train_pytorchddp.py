@@ -25,10 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 os.environ['TOKENIZERS_PARALLELISM'] = "True"
 
-# SageMaker data parallel: Import the library PyTorch API
-#import smdistributed.dataparallel.torch.torch_smddp      
-
-def setup():
+def setup(backend="nccl"):
 
     if 'WORLD_SIZE' in os.environ:
         # Environment variables set by torch.distributed.launch or torchrun
@@ -44,7 +41,7 @@ def setup():
         sys.exit("Can't find the evironment variables for local rank")
         
     # initialize the process group: 여러 노드에 있는 여러 프로세스가 동기화되고 통신합니다
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(local_rank)    
     device = torch.device("cuda", local_rank)    
         
@@ -63,8 +60,38 @@ def setup():
     return config
 
 def cleanup():
-    dist.destroy_process_group()
+    dist.destroy_process_group()    
 
+def _load_chkpt(args, model, optimizer):
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % args.local_rank}    
+    chkpt_files = [file for file in os.listdir(args.chkpt_dir) if file.endswith('.pt')]
+    epochs = [re.search('(\.*[0-9])(?=\.)',file).group() for file in chkpt_files]
+    
+    max_epoch = max(epochs)
+    max_epoch_index = epochs.index(max_epoch)
+    max_epoch_filename = chkpt_files[max_epoch_index]
+    chkpt_path = os.path.join(args.chkpt_dir, max_epoch_filename)
+    
+    logging.info(f"Loading Checkpoint From: {chkpt_path}")
+    chkpt = torch.load(chkpt_path, map_location=map_location)
+    model.load_state_dict(chkpt["model"])
+    optimizer.load_state_dict(chkpt["optimizer"])
+    latest_epoch = chkpt["epoch"] + 1
+    logging.info(f"Loaded checkpoint. Resuming training from epoch: {latest_epoch}")
+    return model, optimizer, latest_epoch
+
+def _save_chkpt(args, model, optimizer, epoch):
+    
+    if args.rank == 0:
+        chkpt_path = os.path.join(args.chkpt_dir, f"chkpt-{epoch}.pt")
+        logging.info("Saving the Checkpoint: {}".format(chkpt_path))
+        state = {
+            "epoch": epoch,
+            "model": model.module.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }
+        torch.save(state, chkpt_path)
+        
 def parser_args(train_notebook=False):
     parser = argparse.ArgumentParser()
 
@@ -85,7 +112,7 @@ def parser_args(train_notebook=False):
     parser.add_argument("--eval_dir", type=str, default=os.environ["SM_CHANNEL_EVAL"])
     parser.add_argument("--output_data_dir", type=str, default=os.environ["SM_OUTPUT_DATA_DIR"])
     parser.add_argument("--model_dir", type=str, default=os.environ["SM_MODEL_DIR"])
-    parser.add_argument('--chkpt_dir', type=str, default='/opt/ml/checkpoints')     
+    parser.add_argument('--chkpt_dir', type=str, default=os.environ["SM_CHECKPOINTS"])    
 
     if train_notebook:
         args = parser.parse_args([])
@@ -138,33 +165,45 @@ def main(args):
         dataset=eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, 
         num_workers=0, shuffle=False
     )
-
-    os.makedirs(args.model_dir, exist_ok=True)
-    os.makedirs(args.output_data_dir, exist_ok=True)    
-    
+        
     model = BertForSequenceClassification.from_pretrained(args.model_id, num_labels=2).to(args.device)
-    model = DDP(model, device_ids=[args.local_rank])
-    
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-    num_training_steps = args.num_epochs * len(train_loader)
-    args.num_training_steps = num_training_steps
+        
+    # Check if checkpoints exists
+    if len(os.listdir(args.chkpt_dir)) > 0:
+        model, optimizer, latest_epoch = _load_chkpt(args, model, optimizer)
+    else:
+        latest_epoch = 1
+        
+    model = DDP(
+        model, 
+        device_ids=[args.local_rank]
+    )
     
-    logging.info(f"num_training_steps: {num_training_steps}")
+    num_training_steps = (args.num_epochs - latest_epoch + 1) * len(train_loader)
+    args.num_training_steps = num_training_steps
+    logging.info(f"Number of Training steps: {num_training_steps}")    
+    
     lr_scheduler = get_scheduler(
         name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
     )
 
-    for epoch in range(1, args.num_epochs+1):
+    for epoch in range(latest_epoch, args.num_epochs+1):
         train_sampler.set_epoch(epoch)
         eval_sampler.set_epoch(epoch)
-        
         train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch)
         eval_model(args, model, eval_loader)
+        _save_chkpt(args, model, optimizer, epoch)        
 
+    # Save model - only save on rank 0        
     if args.model_dir and args.rank == 0:
+        model_filepath = os.path.join(args.model_dir, "multimodal_model.pt")
         logging.info('==== Save Model ====')        
-        torch.save(model.cpu().state_dict(), os.path.join(args.model_dir, "model.pt"))
+        torch.save(model.state_dict(), model_filepath)
             
+    dist.barrier()
+    if args.rank == 0:
+        logging.info("Distributed Training finished successfully!")        
             
 def train_model(args, model, train_loader, eval_loader, optimizer, lr_scheduler, epoch):
     model.train()
@@ -253,20 +292,28 @@ if __name__ == "__main__":
         eval_dir = 'eval'
         model_dir = 'model'
         output_data_dir = 'output_data'
+        chkpt_dir = 'checkpoints'
         src_dir = '/'.join(os.getcwd().split('/')[:-1])
         #src_dir = os.getcwd()
         os.environ['SM_MODEL_DIR'] = f'{src_dir}/{model_dir}'
         os.environ['SM_OUTPUT_DATA_DIR'] = f'{src_dir}/{output_data_dir}'
         os.environ['SM_CHANNEL_TRAIN'] = f'{src_dir}/{train_dir}'
         os.environ['SM_CHANNEL_EVAL'] = f'{src_dir}/{eval_dir}'
+        os.environ['SM_CHECKPOINTS'] = f'{src_dir}/{chkpt_dir}'        
+    else:
+        os.environ['SM_CHECKPOINTS'] = '/opt/ml/checkpoints'        
 
     args = parser_args()
-    config = setup() 
+    config = setup(backend="nccl") 
     args.world_size = config.world_size
     args.rank = config.rank
     args.local_rank = config.local_rank
     args.device = config.device
     
+    os.makedirs(args.model_dir, exist_ok=True)
+    os.makedirs(args.output_data_dir, exist_ok=True) 
+    os.makedirs(args.chkpt_dir, exist_ok=True)         
+        
     start = time.time()
     main(args)     
     secs = time.time() - start
