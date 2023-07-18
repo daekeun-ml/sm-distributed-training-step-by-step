@@ -17,6 +17,7 @@ import evaluate
 from pprint import pformat
 from tqdm.auto import tqdm, trange
 from helper import TqdmLoggingHandler
+import re
 
 # Distributed training
 import torch.distributed as dist
